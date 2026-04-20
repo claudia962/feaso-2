@@ -1,11 +1,19 @@
 """
-STR Feasibility Report Generator.
+Report generator for STR feasibility analyses.
 
-Generates structured markdown reports from analysis data,
-computes overall feasibility scores, and renders PDFs via WeasyPrint.
+Produces three artefacts from a FeasibilityAnalysis ORM row:
+  1. Markdown string  (always)
+  2. HTML string      (always; feeds WeasyPrint)
+  3. PDF bytes        (optional -- requires weasyprint; returns None when absent)
+
+Never raises on missing data; sections fall back to "not available" so the
+output is always complete. Exposes both the new `generate_report()` API and a
+thin `ReportGenerator` class for backward-compat with earlier routes.
 """
+from __future__ import annotations
+
 import os
-import statistics
+import tempfile as _tmpmod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,77 +21,60 @@ from typing import Any, Optional
 
 import structlog
 
+from app.services.rag_engine import query_methodology
+
 logger = structlog.get_logger(__name__)
 
-import tempfile as _tmpmod
-
-# Use /tmp on serverless (read-only filesystem), local dir otherwise
 _local_reports = Path(__file__).parent.parent.parent / "reports"
 if os.environ.get("VERCEL") or not os.access(str(_local_reports.parent), os.W_OK):
     REPORTS_DIR = Path(_tmpmod.gettempdir()) / "feasibility_reports"
 else:
     REPORTS_DIR = _local_reports
-REPORTS_DIR.mkdir(exist_ok=True)
+REPORTS_DIR.mkdir(exist_ok=True, parents=True)
 
 
-# ---------------------------------------------------------------------------
-# Score calculation
-# ---------------------------------------------------------------------------
+@dataclass
+class ReportBundle:
+    markdown: str
+    html: str
+    pdf_bytes: Optional[bytes] = None
+
+
+def generate_report(analysis: Any, *, pdf: bool = True) -> ReportBundle:
+    """Build markdown + HTML (+ optional PDF) for the analysis."""
+    md = _build_markdown(analysis)
+    html = _build_html(md, analysis)
+    pdf_bytes: Optional[bytes] = None
+    if pdf:
+        pdf_bytes = _render_pdf(html)
+    return ReportBundle(markdown=md, html=html, pdf_bytes=pdf_bytes)
+
 
 def calculate_score(data: dict) -> tuple[float, str]:
     """
-    Calculate overall feasibility score (0-100) and recommendation.
+    Score a dict of analysis inputs. Compat shim for the legacy
+    test_report_generator.py expectations.
 
-    Weighted components:
-    - Financial (40pts): cap_rate thresholds
-    - Regulation (20pts): inverted risk score
-    - Market (20pts): occupancy vs market, supply growth
-    - Neighbourhood (10pts): neighborhood_score / 10
-    - Monte Carlo (10pts): probability_of_loss thresholds
+    Inputs (all optional, sensible defaults):
+      cap_rate, regulation_risk_score, avg_occupancy, supply_growth_pct_12mo,
+      neighborhood_score, probability_of_loss.
     """
-    score = 0.0
+    cap_rate = float(data.get("cap_rate") or 0)
+    reg_risk = float(data.get("regulation_risk_score") or 50)
+    occ = float(data.get("avg_occupancy") or 0)
+    supply = float(data.get("supply_growth_pct_12mo") or 0)
+    nbhd = float(data.get("neighborhood_score") or 50)
+    ploss = float(data.get("probability_of_loss") or 0.3)
 
-    # Financial (40pts)
-    cap_rate = data.get("cap_rate", 0) or 0
-    if cap_rate > 0.05:
-        score += 40
-    elif cap_rate > 0.04:
-        score += 30
-    elif cap_rate > 0.03:
-        score += 20
-    elif cap_rate > 0.02:
-        score += 10
-    elif cap_rate > 0.01:
-        score += 5
+    cap_pts = min(30.0, max(-10.0, cap_rate * 300.0))             # 10% cap → 30 pts
+    occ_pts = min(20.0, max(0.0, occ) * 20.0)                     # 100% occ → 20 pts
+    reg_pts = max(0.0, (100.0 - reg_risk) * 0.18)                 # permissive → 18 pts
+    nbhd_pts = max(0.0, nbhd * 0.15)                              # 100 → 15 pts
+    supply_pts = max(0.0, 10.0 - supply)                          # low supply growth → 10 pts
+    loss_pts = max(0.0, (1.0 - ploss) * 10.0)                     # low risk of loss → 10 pts
 
-    # Regulation (20pts): inverted risk score (25 risk = 15pts, 100 risk = 0pts)
-    reg_risk = data.get("regulation_risk_score", 50) or 50
-    reg_score = max(0, (100 - reg_risk) / 100 * 20)
-    score += reg_score
-
-    # Market (20pts): occupancy vs market + supply
-    avg_occ = data.get("avg_occupancy", 0) or 0
-    supply_growth = data.get("supply_growth_pct_12mo", 0) or 0
-    occ_score = min(20, avg_occ * 25)  # 80% occ = 20pts
-    supply_penalty = min(5, supply_growth * 0.5)
-    score += max(0, occ_score - supply_penalty)
-
-    # Neighbourhood (10pts)
-    nbhd_score = data.get("neighborhood_score", 50) or 50
-    score += nbhd_score / 10
-
-    # Monte Carlo (10pts)
-    prob_loss = data.get("probability_of_loss", 0.5) or 0.5
-    if prob_loss < 0.10:
-        score += 10
-    elif prob_loss < 0.20:
-        score += 7
-    elif prob_loss < 0.30:
-        score += 4
-    elif prob_loss < 0.50:
-        score += 2
-
-    score = min(100, max(0, round(score, 1)))
+    total = cap_pts + occ_pts + reg_pts + nbhd_pts + supply_pts + loss_pts
+    score = max(0.0, min(100.0, total))
 
     if score >= 75:
         rec = "strong_buy"
@@ -95,299 +86,92 @@ def calculate_score(data: dict) -> tuple[float, str]:
         rec = "avoid"
     else:
         rec = "strong_avoid"
+    return round(score, 2), rec
 
-    return score, rec
-
-
-# ---------------------------------------------------------------------------
-# Markdown report generator
-# ---------------------------------------------------------------------------
 
 class ReportGenerator:
-    """Generates markdown and PDF reports from feasibility analysis data."""
+    """Compat shim for the older API used by earlier routes."""
 
     def generate_overall_score(self, data: dict) -> tuple[float, str]:
-        """Compute score and recommendation from analysis data dict."""
         return calculate_score(data)
 
     def generate_markdown(self, analysis_id: str, data: dict) -> str:
         """
-        Generate a full markdown report from analysis data.
-        Substitutes all {{variable}} placeholders.
+        Dict-based markdown render. Lightweight — sufficient for tests + smoke
+        use. For the canonical ORM-backed report, call generate_report(analysis).
         """
-        address = data.get("address", "Unknown Address")
-        created_at = data.get("created_at", datetime.now(timezone.utc).isoformat())
-        score, rec = self.generate_overall_score(data)
-        rec_label = rec.replace("_", " ").title()
-        rec_emoji = {"strong_buy": "🟢", "buy": "🟩", "hold": "🟡",
-                     "avoid": "🟠", "strong_avoid": "🔴"}.get(rec, "⚪")
+        addr = data.get("address", "Unknown")
+        created = data.get("created_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        score, rec = calculate_score(data)
+        parts: list[str] = []
+        parts.append(f"# Feasibility Report -- {addr}")
+        parts.append(f"_Analysis ID: `{analysis_id}` | Generated: {created}_")
+        parts.append("")
+        parts.append("## 1. Executive Summary")
+        parts.append(f"**Score:** {score:.0f} / 100 -- **{rec.replace('_', ' ').upper()}**")
+        parts.append(f"- Gross revenue: {_money(data.get('gross_revenue'))}")
+        parts.append(f"- NOI: {_money(data.get('noi'))}")
+        parts.append(f"- Cap rate: {_pct(data.get('cap_rate'), 2)}")
+        parts.append(f"- Cash-on-cash: {_pct(data.get('cash_on_cash_return'), 2)}")
+        parts.append(f"- Break-even occupancy: {_pct(data.get('break_even_occupancy'), 1)}")
+        parts.append("")
+        parts.append("## 2. Comparable Analysis")
+        comps = data.get("comps") or []
+        parts.append(f"Comps: {len(comps)} records" if comps else "_No comparable properties supplied._")
+        parts.append("")
+        parts.append("## 3. Regulatory Risk")
+        parts.append(f"- STR allowed: **{data.get('str_allowed')}**")
+        parts.append(f"- Regulation risk score: **{data.get('regulation_risk_score')}/100**")
+        parts.append("")
+        parts.append("## 4. Neighbourhood")
+        parts.append(f"- Walk Score: **{data.get('walk_score')}**")
+        parts.append(f"- Nearest airport: **{data.get('nearest_airport_km')} km**")
+        parts.append(f"- Nearest downtown: **{data.get('nearest_downtown_km')} km**")
+        parts.append(f"- Best for: {', '.join(data.get('best_for') or []) or '-'}")
+        parts.append(f"- Neighbourhood score: **{data.get('neighborhood_score')}/100**")
+        parts.append("")
+        parts.append("## 5. Financial Projections")
+        parts.append(f"- Average ADR: {_money(data.get('avg_adr'))}")
+        parts.append(f"- Average occupancy: {_pct(data.get('avg_occupancy'), 1)}")
+        parts.append("")
+        parts.append("### Monte Carlo")
+        parts.append(f"- P10 revenue: {_money(data.get('mc_revenue_p10'))}")
+        parts.append(f"- P50 revenue: {_money(data.get('mc_revenue_p50'))}")
+        parts.append(f"- P90 revenue: {_money(data.get('mc_revenue_p90'))}")
+        parts.append(f"- Probability of loss: {_pct(data.get('probability_of_loss'), 1)}")
+        parts.append("")
+        parts.append("## 6. Stress Tests")
+        st = data.get("stress_tests") or []
+        parts.append(f"{len(st)} scenarios recorded." if st else "_No stress tests supplied._")
+        parts.append("")
+        parts.append("## 7. Event Calendar")
+        parts.append("_No event data supplied._")
+        parts.append("")
+        parts.append("## 8. Portfolio Fit")
+        parts.append("_Portfolio fit not computed in legacy dict mode._")
+        parts.append("")
+        parts.append("## 9. Renovation Opportunities")
+        renos = data.get("renovations") or []
+        parts.append(f"{len(renos)} opportunities." if renos else "_No renovation analysis supplied._")
+        parts.append("")
+        parts.append("## 10. Exit Strategies")
+        exits = data.get("exit_strategies") or []
+        parts.append(f"{len(exits)} exit strategies." if exits else "_No exit modelling supplied._")
+        parts.append("")
+        parts.append("## 11. Supply Pipeline")
+        parts.append(f"- Supply growth (12mo): **{data.get('supply_growth_pct_12mo')}%**")
+        parts.append(f"- New listings (12mo): **{data.get('new_listings_last_12mo')}**")
+        parts.append("")
+        parts.append("---")
+        parts.append("_Generated via ReportGenerator compat shim._")
+        return "\n".join(parts)
 
-        # Financials
-        gross_rev = data.get("gross_revenue", 0) or 0
-        noi = data.get("noi", 0) or 0
-        cap_rate = (data.get("cap_rate", 0) or 0) * 100
-        coc = (data.get("cash_on_cash_return", 0) or 0) * 100
-        break_even = (data.get("break_even_occupancy", 0) or 0) * 100
-        avg_adr = data.get("avg_adr", 0) or 0
-        avg_occ = (data.get("avg_occupancy", 0) or 0) * 100
-
-        # Comps
-        comps = data.get("comps", [])
-        comp_adrs = [c.get("avg_adr", 0) for c in comps if c.get("avg_adr")]
-        adr_percentile = 50
-        if comp_adrs and avg_adr:
-            below = sum(1 for a in comp_adrs if a < avg_adr)
-            adr_percentile = int(below / len(comp_adrs) * 100)
-
-        # Monte Carlo
-        mc_p10 = data.get("mc_revenue_p10", 0) or 0
-        mc_p50 = data.get("mc_revenue_p50", 0) or 0
-        mc_p90 = data.get("mc_revenue_p90", 0) or 0
-        prob_loss = (data.get("probability_of_loss", 0) or 0) * 100
-
-        # Regulation
-        str_allowed = data.get("str_allowed", True)
-        reg_risk = data.get("regulation_risk_score", 25) or 25
-        reg_note = data.get("pending_legislation", "No pending legislation noted.")
-
-        # Neighbourhood
-        walk = data.get("walk_score", "N/A")
-        nbhd_score = data.get("neighborhood_score", 0) or 0
-        airport_km = data.get("nearest_airport_km", "N/A")
-        cbd_km = data.get("nearest_downtown_km", "N/A")
-        best_for = ", ".join(data.get("best_for", ["couples"])) or "general"
-
-        # Supply
-        supply_growth = data.get("supply_growth_pct_12mo", 4.2) or 4.2
-        new_listings_12mo = data.get("new_listings_last_12mo", 85) or 85
-
-        # Stress tests
-        stress_tests = data.get("stress_tests", [])
-
-        # Renovations
-        renovations = data.get("renovations", [])
-        top_renos = sorted(renovations, key=lambda r: r.get("roi_1yr_pct", 0), reverse=True)[:3]
-
-        # Exit strategies
-        exits = data.get("exit_strategies", [])
-        str_exit = next((e for e in exits if e.get("strategy_type") == "continue_str"), {})
-        ltr_exit = next((e for e in exits if e.get("strategy_type") == "long_term_rental"), {})
-        sell_exit = next((e for e in exits if e.get("strategy_type") == "sell"), {})
-
-        # Recommendation reasoning
-        reasoning = self._generate_reasoning(data, score, rec, cap_rate, avg_occ, prob_loss)
-
-        # Build markdown
-        md = f"""# STR Feasibility Report — {address}
-
-**Generated:** {created_at[:10]}  
-**Analysis ID:** {analysis_id}
-
----
-
-## Executive Summary
-
-{rec_emoji} **Overall Score: {score:.0f}/100** — {rec_label}
-
-{reasoning}
-
-### Key Metrics at a Glance
-
-| Metric | Value |
-|--------|-------|
-| Projected Annual Revenue | ${gross_rev:,.0f} |
-| Net Operating Income (NOI) | ${noi:,.0f} |
-| Cap Rate | {cap_rate:.2f}% |
-| Cash-on-Cash Return | {coc:.2f}% |
-| Break-Even Occupancy | {break_even:.0f}% |
-| Average Daily Rate (ADR) | ${avg_adr:.0f} |
-| Average Occupancy | {avg_occ:.0f}% |
-
----
-
-## 1. Comparable Analysis
-
-**{len(comps)} comparable properties** found within search radius.  
-Your projected ADR of **${avg_adr:.0f}** places you at the **{adr_percentile}th percentile** of comparable properties.
-
-| Property | Distance | Beds | ADR | Occupancy | Similarity |
-|----------|----------|------|-----|-----------|------------|
-"""
-        for comp in comps[:8]:
-            md += (f"| {(comp.get('comp_name') or 'N/A')[:35]} "
-                   f"| {comp.get('distance_km', '?')} km "
-                   f"| {comp.get('bedrooms', '?')} "
-                   f"| ${comp.get('avg_adr', 0):,.0f} "
-                   f"| {(comp.get('occupancy_rate', 0) or 0)*100:.0f}% "
-                   f"| {comp.get('similarity_score', 0):.2f} |\n")
-
-        md += f"""
-*Data source: {comps[0].get('data_source', 'mock') if comps else 'mock'}*
-
----
-
-## 2. Regulatory Risk
-
-**STR Allowed:** {'✅ Yes' if str_allowed else '🚫 No'}  
-**Regulation Risk Score:** {reg_risk}/100 (lower = less risk)
-
-> ⚠️ {reg_note}
-
-*Last verified: {data.get("reg_last_verified", datetime.now().strftime("%Y-%m-%d"))}*
-
----
-
-## 3. Neighbourhood
-
-| Score | Walk Score | Airport | CBD | Best For |
-|-------|-----------|---------|-----|---------|
-| {nbhd_score:.0f}/100 | {walk} | {airport_km} km | {cbd_km} km | {best_for} |
-
----
-
-## 4. Financial Projections
-
-### Three Scenarios
-
-| Scenario | Gross Revenue | NOI | Cap Rate | Cash-on-Cash |
-|----------|--------------|-----|----------|-------------|
-"""
-        for scenario_key in ["pessimistic", "base", "optimistic"]:
-            s = data.get(f"scenario_{scenario_key}", {})
-            if s:
-                md += (f"| {scenario_key.title()} "
-                       f"| ${s.get('gross_revenue', 0):,.0f} "
-                       f"| ${s.get('noi', 0):,.0f} "
-                       f"| {(s.get('cap_rate', 0) or 0)*100:.2f}% "
-                       f"| {(s.get('coc', 0) or 0)*100:.2f}% |\n")
-
-        md += f"""
-**Break-Even Occupancy:** {break_even:.1f}%  
-*(Property needs ≥{break_even:.1f}% occupancy to cover all expenses including mortgage)*
-
----
-
-## 5. Monte Carlo Simulation (2,000 runs)
-
-| Percentile | Annual Revenue |
-|------------|---------------|
-| P10 (pessimistic) | ${mc_p10:,.0f} |
-| P50 (median) | ${mc_p50:,.0f} |
-| P90 (optimistic) | ${mc_p90:,.0f} |
-
-**Probability of Loss (NOI < 0):** {prob_loss:.1f}%
-
----
-
-## 6. Stress Test Scenarios
-
-| Scenario | Revenue Impact | Still Profitable | Adaptation |
-|----------|---------------|-----------------|------------|
-"""
-        for st in stress_tests[:7]:
-            impact = (st.get("revenue_impact_pct", 0) or 0) * 100
-            profitable = "✅" if st.get("still_profitable") else "🚫"
-            strategy_short = (st.get("adaptation_strategy", "") or "")[:60]
-            md += (f"| {st.get('scenario_name', 'N/A')[:30]} "
-                   f"| {impact:+.1f}% "
-                   f"| {profitable} "
-                   f"| {strategy_short}... |\n")
-
-        md += f"""
----
-
-## 7. Supply Pipeline
-
-**New listings (last 12 months):** {new_listings_12mo}  
-**Supply growth:** {supply_growth:.1f}%  
-Estimated ADR pressure: {data.get("estimated_adr_pressure_pct", -1.3):.1f}%
-
----
-
-## 8. Renovation Opportunities
-
-| Item | Cost | Annual Uplift | Payback | Recommendation |
-|------|------|--------------|---------|---------------|
-"""
-        for reno in top_renos:
-            md += (f"| {reno.get('renovation_item','').replace('_',' ').title()} "
-                   f"| ${reno.get('estimated_cost', 0):,.0f} "
-                   f"| ${reno.get('annual_revenue_increase', 0):,.0f} "
-                   f"| {reno.get('payback_period_months', 999)} mo "
-                   f"| {reno.get('recommendation','').replace('_',' ').title()} |\n")
-
-        md += f"""
----
-
-## 9. Exit Strategies
-
-| Strategy | Monthly Income | Annual Return | Notes |
-|----------|---------------|--------------|-------|
-| Continue STR | ${(str_exit.get('estimated_monthly_income', 0) or 0):,.0f} | {(str_exit.get('estimated_annual_return', 0) or 0)*100:.1f}% | {(str_exit.get('notes','') or '')[:60]} |
-| Long-Term Rental | ${(ltr_exit.get('estimated_monthly_income', 0) or 0):,.0f} | {(ltr_exit.get('estimated_annual_return', 0) or 0)*100:.1f}% | {(ltr_exit.get('notes','') or '')[:60]} |
-| Sell | $0 | {(sell_exit.get('estimated_annual_return', 0) or 0)*100:.1f}% | {(sell_exit.get('notes','') or '')[:60]} |
-
----
-
-## Methodology & Disclaimer
-
-- Comparable data: Inside Airbnb (Melbourne, Sep 2025) / Airbnb live search
-- Financial modelling: Monte Carlo simulation (2,000 runs)
-- Regulation data: Manually verified as at {datetime.now().strftime("%Y-%m-%d")}
-- **All projections are estimates. Past performance does not guarantee future results.**
-- This report is for informational purposes only and does not constitute financial advice.
-
----
-*Generated by STR Feasibility Calculator v1.0 | {datetime.now().strftime("%Y-%m-%d %H:%M")} UTC*
-"""
-        return md
-
-    def _generate_reasoning(self, data: dict, score: float, rec: str,
-                             cap_rate: float, avg_occ: float, prob_loss: float) -> str:
-        """Generate 2-3 sentence specific recommendation reasoning."""
-        address = data.get("address", "This property")
-        gross = data.get("gross_revenue", 0) or 0
-        reg_risk = data.get("regulation_risk_score", 25) or 25
-        noi = data.get("noi", 0) or 0
-
-        if rec in ("strong_buy", "buy"):
-            return (
-                f"**{address}** presents a {rec.replace('_',' ')} opportunity with a projected "
-                f"gross revenue of **${gross:,.0f}/year** and cap rate of **{cap_rate:.1f}%**. "
-                f"At **{avg_occ:.0f}% occupancy**, the property is positioned above market "
-                f"break-even, and Monte Carlo analysis indicates only **{prob_loss:.0f}% probability of loss**. "
-                f"Regulatory risk is {'low' if reg_risk < 30 else 'moderate'} ({reg_risk}/100)."
-            )
-        elif rec == "hold":
-            return (
-                f"**{address}** shows mixed signals — projected NOI of **${noi:,.0f}** is "
-                f"{'positive' if noi > 0 else 'negative'} at a cap rate of **{cap_rate:.1f}%**. "
-                f"The **{prob_loss:.0f}% probability of loss** warrants caution. "
-                f"Consider optimising listing quality and pricing strategy before committing."
-            )
-        else:
-            return (
-                f"**{address}** does not currently meet investment thresholds at projected "
-                f"cap rate of **{cap_rate:.1f}%** and NOI of **${noi:,.0f}**. "
-                f"Monte Carlo shows **{prob_loss:.0f}% probability of loss** across simulations. "
-                f"Review purchase price, renovation budget, or consider alternative investment structures."
-            )
-
-    async def generate_pdf(self, analysis_id: str, db) -> str:
-        """
-        Generate PDF report for an analysis.
-        Returns the file path.
-        """
-        from sqlalchemy import select
+    async def generate_pdf(self, analysis_id: str, db: Any) -> str:
+        from sqlalchemy import select, update
         from sqlalchemy.orm import selectinload
-        from app.models.database_models import (
-            FeasibilityAnalysis, CompAnalysis, FeasibilityStressTest,
-            FinancialProjection, NeighborhoodScore, RegulationAssessment,
-            RenovationAnalysis, ExitStrategy, SupplyPipeline
-        )
+        from app.models.database_models import FeasibilityAnalysis
 
-        # Load analysis data
-        result = await db.execute(
+        q = (
             select(FeasibilityAnalysis)
             .options(
                 selectinload(FeasibilityAnalysis.comp_analyses),
@@ -397,109 +181,338 @@ Estimated ADR pressure: {data.get("estimated_adr_pressure_pct", -1.3):.1f}%
                 selectinload(FeasibilityAnalysis.regulation_assessments),
                 selectinload(FeasibilityAnalysis.renovation_analyses),
                 selectinload(FeasibilityAnalysis.exit_strategies),
+                selectinload(FeasibilityAnalysis.portfolio_fit),
                 selectinload(FeasibilityAnalysis.supply_pipeline),
             )
             .where(FeasibilityAnalysis.id == analysis_id)
         )
-        analysis = result.scalar_one_or_none()
-        if not analysis:
+        row = (await db.execute(q)).scalar_one_or_none()
+        if not row:
             raise ValueError(f"Analysis {analysis_id} not found")
 
-        # Build data dict
-        base_fp = next((fp for fp in analysis.financial_projections if fp.projection_type == "base"), None)
-        ns = analysis.neighborhood_scores[0] if analysis.neighborhood_scores else None
-        reg = analysis.regulation_assessments[0] if analysis.regulation_assessments else None
-        supply = analysis.supply_pipeline[0] if analysis.supply_pipeline else None
-        mc_data = base_fp.annual_expenses or {} if base_fp else {}
+        bundle = generate_report(row, pdf=True)
+        suffix = "pdf" if bundle.pdf_bytes else "html"
+        out_path = REPORTS_DIR / f"feaso-{analysis_id}.{suffix}"
+        if bundle.pdf_bytes:
+            out_path.write_bytes(bundle.pdf_bytes)
+        else:
+            out_path.write_text(bundle.html, encoding="utf-8")
 
-        data = {
-            "address": analysis.address,
-            "created_at": str(analysis.created_at),
-            "gross_revenue": float(base_fp.year1_gross_revenue or 0) if base_fp else 0,
-            "noi": float(base_fp.noi or 0) if base_fp else 0,
-            "cap_rate": float(base_fp.cap_rate or 0) if base_fp else 0,
-            "cash_on_cash_return": float(base_fp.cash_on_cash_return or 0) if base_fp else 0,
-            "break_even_occupancy": float(base_fp.break_even_occupancy or 0) if base_fp else 0,
-            "avg_adr": statistics.median([float(c.avg_adr) for c in analysis.comp_analyses if c.avg_adr]) if analysis.comp_analyses else 180,
-            "avg_occupancy": statistics.median([float(c.occupancy_rate) for c in analysis.comp_analyses if c.occupancy_rate]) if analysis.comp_analyses else 0.65,
-            "comps": [{"comp_name": c.comp_name, "distance_km": float(c.distance_km or 0), "bedrooms": c.bedrooms,
-                       "avg_adr": float(c.avg_adr or 0), "occupancy_rate": float(c.occupancy_rate or 0),
-                       "similarity_score": float(c.similarity_score or 0), "data_source": c.data_source}
-                      for c in analysis.comp_analyses[:8]],
-            "mc_revenue_p10": float(base_fp.mc_revenue_p10 or 0) if base_fp else 0,
-            "mc_revenue_p50": float(base_fp.mc_revenue_p50 or 0) if base_fp else 0,
-            "mc_revenue_p90": float(base_fp.mc_revenue_p90 or 0) if base_fp else 0,
-            "probability_of_loss": mc_data.get("mc_probability_of_loss", 0.3),
-            "str_allowed": reg.str_allowed if reg else True,
-            "regulation_risk_score": float(reg.regulation_risk_score or 25) if reg else 25,
-            "pending_legislation": reg.pending_legislation if reg else "",
-            "reg_last_verified": str(reg.last_verified)[:10] if reg and reg.last_verified else datetime.now().strftime("%Y-%m-%d"),
-            "neighborhood_score": float(ns.neighborhood_score or 0) if ns else 0,
-            "walk_score": ns.walk_score if ns else "N/A",
-            "nearest_airport_km": float(ns.nearest_airport_km or 0) if ns else "N/A",
-            "nearest_downtown_km": float(ns.nearest_downtown_km or 0) if ns else "N/A",
-            "best_for": ns.best_for or [] if ns else [],
-            "supply_growth_pct_12mo": float(supply.supply_growth_pct_12mo or 0) if supply else 4.2,
-            "new_listings_last_12mo": supply.new_listings_last_12mo if supply else 0,
-            "stress_tests": [{"scenario_name": st.scenario_name, "revenue_impact_pct": float(st.revenue_impact_pct or 0),
-                              "still_profitable": st.still_profitable, "adaptation_strategy": st.adaptation_strategy}
-                             for st in analysis.stress_tests],
-            "renovations": [{"renovation_item": r.renovation_item, "estimated_cost": float(r.estimated_cost or 0),
-                             "annual_revenue_increase": 0, "payback_period_months": 0,
-                             "roi_1yr_pct": float(r.roi_1yr_pct or 0) * 100, "recommendation": r.recommendation}
-                            for r in analysis.renovation_analyses],
-            "exit_strategies": [{"strategy_type": e.strategy_type, "estimated_monthly_income": float(e.estimated_monthly_income or 0),
-                                  "estimated_annual_return": float(e.estimated_annual_return or 0), "notes": e.notes}
-                                 for e in analysis.exit_strategies],
-        }
-
-        markdown_content = self.generate_markdown(str(analysis_id), data)
-
-        # Save markdown
-        md_path = REPORTS_DIR / f"{analysis_id}.md"
-        md_path.write_text(markdown_content, encoding="utf-8")
-
-        # Convert to PDF
-        pdf_path = REPORTS_DIR / f"{analysis_id}.pdf"
-        try:
-            import markdown2
-            html_content = markdown2.markdown(markdown_content, extras=["tables", "fenced-code-blocks"])
-            styled_html = f"""
-<!DOCTYPE html><html><head><meta charset="utf-8">
-<style>
-body {{ font-family: Arial, sans-serif; margin: 40px; color: #1a1a2e; line-height: 1.6; }}
-h1 {{ color: #0F172A; border-bottom: 3px solid #AF7225; padding-bottom: 10px; }}
-h2 {{ color: #0F172A; border-bottom: 1px solid #e0e0e0; margin-top: 30px; }}
-table {{ border-collapse: collapse; width: 100%; margin: 15px 0; }}
-th {{ background: #0F172A; color: white; padding: 8px; text-align: left; }}
-td {{ border: 1px solid #ddd; padding: 8px; }}
-tr:nth-child(even) {{ background: #f9f9f9; }}
-blockquote {{ border-left: 4px solid #AF7225; padding-left: 15px; color: #555; }}
-code {{ background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }}
-</style></head><body>{html_content}</body></html>"""
-
-            try:
-                from weasyprint import HTML
-                HTML(string=styled_html).write_pdf(str(pdf_path))
-                logger.info("report.pdf_generated", path=str(pdf_path))
-            except ImportError:
-                # WeasyPrint not installed — save HTML instead
-                html_path = REPORTS_DIR / f"{analysis_id}.html"
-                html_path.write_text(styled_html, encoding="utf-8")
-                pdf_path = html_path
-                logger.warning("report.weasyprint_not_installed", html_saved=str(html_path))
-
-        except Exception as exc:
-            logger.error("report.pdf_error", error=str(exc))
-            pdf_path = md_path  # Fall back to markdown
-
-        # Update DB
-        from sqlalchemy import update
         await db.execute(
             update(FeasibilityAnalysis)
             .where(FeasibilityAnalysis.id == analysis_id)
-            .values(report_content=markdown_content, report_pdf_path=str(pdf_path))
+            .values(report_content=bundle.markdown, report_pdf_path=str(out_path))
         )
         await db.commit()
+        return str(out_path)
 
-        return str(pdf_path)
+
+def _build_markdown(a: Any) -> str:
+    parts: list[str] = []
+
+    parts.append(f"# Feasibility Report -- {a.address}")
+    parts.append("")
+    parts.append(f"_Analysis ID: `{a.id}` | Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}_")
+    parts.append("")
+    parts.append("## 1. Executive Summary")
+    parts.append("")
+    score = float(a.overall_feasibility_score) if a.overall_feasibility_score is not None else 0.0
+    risk = float(a.risk_score) if a.risk_score is not None else 0.0
+    rec = (a.recommendation or "pending").replace("_", " ").upper()
+    traffic = "GREEN" if score >= 60 else ("AMBER" if score >= 45 else "RED")
+    parts.append(f"**Score:** [{traffic}] **{score:.0f} / 100** -- **{rec}**  ")
+    parts.append(f"**Risk score:** {risk:.0f} / 100  ")
+    if a.recommendation_reasoning:
+        parts.append("")
+        parts.append(f"**Reasoning:** {a.recommendation_reasoning}")
+    parts.append("")
+
+    base_fp = _base_projection(a)
+    if base_fp:
+        parts.append("**Key metrics:**")
+        parts.append(f"- Year 1 revenue: **{_money(base_fp.year1_gross_revenue)}**")
+        parts.append(f"- NOI: **{_money(base_fp.noi)}**")
+        parts.append(f"- Cap rate: **{_pct(base_fp.cap_rate, 2)}**")
+        parts.append(f"- Cash-on-cash: **{_pct(base_fp.cash_on_cash_return, 2)}**")
+        if base_fp.break_even_occupancy is not None:
+            parts.append(f"- Break-even occupancy: **{float(base_fp.break_even_occupancy):.1f}%**")
+    parts.append("")
+
+    parts.append("## 2. Comparable Analysis")
+    parts.append("")
+    comps = list(getattr(a, "comp_analyses", None) or [])
+    if comps:
+        parts.append(f"Using **{len(comps)} comparable properties** ranked by weighted similarity.")
+        parts.append("")
+        parts.append("| # | Comp | BR | ADR | Occ. | Annual rev | Similarity | Dist |")
+        parts.append("|---|------|----|-----|------|------------|------------|------|")
+        for i, c in enumerate(sorted(comps, key=lambda c: float(c.similarity_score or 0), reverse=True)[:10], 1):
+            parts.append(
+                f"| {i} | {c.comp_name or c.comp_listing_id or '-'} "
+                f"| {c.bedrooms or '-'} "
+                f"| {_money(c.avg_adr)} "
+                f"| {_pct(c.occupancy_rate, 0)} "
+                f"| {_money(c.annual_revenue)} "
+                f"| {_pct(c.similarity_score, 0)} "
+                f"| {_float(c.distance_km, '-', ' km')} |"
+            )
+    else:
+        parts.append("_No comparable properties recorded for this analysis._")
+    parts.append("")
+
+    parts.append("## 3. Regulatory Risk")
+    parts.append("")
+    regs = list(getattr(a, "regulation_assessments", None) or [])
+    if regs:
+        r = regs[0]
+        indicator = "[ALLOWED]" if r.str_allowed else "[NOT PERMITTED]"
+        parts.append(f"**{indicator}** in {r.municipality or '-'}.  ")
+        parts.append(f"- Permit required: **{'yes' if r.permit_required else 'no'}**")
+        cap = r.max_nights_per_year
+        parts.append(f"- Night cap: **{cap if cap is not None else 'uncapped'}**")
+        parts.append(f"- Regulation risk score: **{_float(r.regulation_risk_score)}/100**")
+        if r.last_verified:
+            parts.append(f"- Last verified: **{r.last_verified.date().isoformat()}**")
+        if r.notes:
+            parts.append("")
+            parts.append(r.notes)
+    else:
+        parts.append("_No regulation assessment recorded._")
+    parts.append("")
+
+    parts.append("## 4. Neighbourhood")
+    parts.append("")
+    nbhds = list(getattr(a, "neighborhood_scores", None) or [])
+    if nbhds:
+        n = nbhds[0]
+        parts.append(f"- Walk Score: **{n.walk_score or '-'}**")
+        parts.append(f"- Transit Score: **{n.transit_score or '-'}**")
+        parts.append(f"- Bike Score: **{n.bike_score or '-'}**")
+        if n.nearest_airport_name:
+            parts.append(f"- Nearest airport: **{n.nearest_airport_name}** ({_float(n.nearest_airport_km, '-', ' km')})")
+        if n.nearest_downtown_km is not None:
+            parts.append(f"- Nearest downtown: **{_float(n.nearest_downtown_km, '-', ' km')}**")
+        if n.best_for:
+            parts.append(f"- Best for: {', '.join(n.best_for)}")
+        if n.neighborhood_score is not None:
+            parts.append(f"- Composite score: **{_float(n.neighborhood_score)}/100**")
+    else:
+        parts.append("_Neighbourhood data not yet captured._")
+    parts.append("")
+
+    parts.append("## 5. Financial Projections")
+    parts.append("")
+    projections = list(getattr(a, "financial_projections", None) or [])
+    if projections:
+        parts.append("### Scenario comparison")
+        parts.append("")
+        parts.append("| Scenario | Y1 revenue | NOI | Cap rate | CoC | Break-even occ. |")
+        parts.append("|----------|-----------|-----|----------|-----|-----------------|")
+        order = {"pessimistic": 0, "base": 1, "optimistic": 2}
+        for p in sorted(projections, key=lambda p: order.get(p.projection_type, 3)):
+            parts.append(
+                f"| {p.projection_type} "
+                f"| {_money(p.year1_gross_revenue)} "
+                f"| {_money(p.noi)} "
+                f"| {_pct(p.cap_rate, 2)} "
+                f"| {_pct(p.cash_on_cash_return, 2)} "
+                f"| {_float(p.break_even_occupancy, '-', '%')} |"
+            )
+        if base_fp and base_fp.monthly_projections:
+            parts.append("")
+            parts.append("### Monthly base projections")
+            parts.append("")
+            parts.append("| Month | ADR | Occupancy | Revenue |")
+            parts.append("|-------|-----|-----------|---------|")
+            for mp in base_fp.monthly_projections:
+                parts.append(
+                    f"| {str(mp.get('month','')).upper()} "
+                    f"| ${float(mp.get('adr', 0)):.0f} "
+                    f"| {float(mp.get('occupancy', 0)) * 100:.0f}% "
+                    f"| ${float(mp.get('revenue', 0)):,.0f} |"
+                )
+        meta = getattr(a, "metadata_", None) or {}
+        mc = meta.get("monte_carlo") if isinstance(meta, dict) else None
+        if mc and base_fp:
+            parts.append("")
+            parts.append("### Monte Carlo (2,000 simulations)")
+            parts.append("")
+            parts.append(f"- P10 revenue: **{_money(base_fp.mc_revenue_p10)}**")
+            parts.append(f"- P50 revenue: **{_money(base_fp.mc_revenue_p50)}**")
+            parts.append(f"- P90 revenue: **{_money(base_fp.mc_revenue_p90)}**")
+            pol = mc.get("probability_of_loss")
+            if pol is not None:
+                parts.append(f"- Probability of loss: **{float(pol) * 100:.1f}%**")
+    else:
+        parts.append("_No financial projections available._")
+    parts.append("")
+
+    parts.append("## 6. Stress Tests")
+    parts.append("")
+    stresses = list(getattr(a, "stress_tests", None) or [])
+    if stresses:
+        parts.append("| Scenario | Revenue impact | Profitable? | Adaptation |")
+        parts.append("|----------|----------------|-------------|-----------|")
+        for s in stresses:
+            imp = f"{float(s.revenue_impact_pct):.1f}%" if s.revenue_impact_pct is not None else "-"
+            prof = "yes" if s.still_profitable else "no"
+            parts.append(f"| {s.scenario_name} | {imp} | {prof} | {s.adaptation_strategy or '-'} |")
+    else:
+        parts.append("_No stress tests recorded._")
+    parts.append("")
+
+    parts.append("## 7. Event Calendar")
+    parts.append("")
+    meta_all = getattr(a, "metadata_", None) or {}
+    meta_ev = meta_all.get("event_impact") if isinstance(meta_all, dict) else None
+    if meta_ev:
+        parts.append(f"- Events within 10km: **{meta_ev.get('events_within_radius', 0)}**")
+        parts.append(f"- Total event nights: **{meta_ev.get('total_event_nights', 0)}**")
+        parts.append(f"- Annual revenue contribution: **{_money(meta_ev.get('annual_revenue_contribution'))}**")
+        if meta_ev.get("comparison"):
+            parts.append("")
+            parts.append(f"_{meta_ev['comparison']}_")
+    else:
+        parts.append("_No event data captured._")
+    parts.append("")
+
+    parts.append("## 8. Portfolio Fit")
+    parts.append("")
+    pf_rows = list(getattr(a, "portfolio_fit", None) or [])
+    if pf_rows:
+        pf = pf_rows[0]
+        parts.append(f"- Existing property count: **{pf.existing_property_count or 0}**")
+        if pf.overall_portfolio_fit_score is not None:
+            parts.append(f"- Overall fit score: **{_float(pf.overall_portfolio_fit_score)}/100**")
+        if pf.recommendation:
+            parts.append("")
+            parts.append(pf.recommendation)
+    else:
+        parts.append("_Portfolio fit not computed._")
+    parts.append("")
+
+    parts.append("## 9. Renovation Opportunities")
+    parts.append("")
+    renos = list(getattr(a, "renovation_analyses", None) or [])
+    if renos:
+        parts.append("| Item | Cost | ROI 1y | Recommendation |")
+        parts.append("|------|------|--------|----------------|")
+        for r in renos:
+            parts.append(
+                f"| {r.renovation_item} | {_money(r.estimated_cost)} "
+                f"| {_pct(r.roi_1yr_pct, 1)} | {r.recommendation or '-'} |"
+            )
+    else:
+        parts.append("_No renovation analysis computed._")
+    parts.append("")
+
+    parts.append("## 10. Exit Strategies")
+    parts.append("")
+    exits = list(getattr(a, "exit_strategies", None) or [])
+    if exits:
+        parts.append("| Strategy | Monthly income | Annual return | Notes |")
+        parts.append("|----------|----------------|---------------|-------|")
+        for e in exits:
+            parts.append(
+                f"| {e.strategy_type} | {_money(e.estimated_monthly_income)} "
+                f"| {_pct(e.estimated_annual_return, 2)} | {e.notes or '-'} |"
+            )
+    else:
+        parts.append("_Exit strategy modelling not run._")
+    parts.append("")
+
+    parts.append("## 11. Methodology & Sources")
+    parts.append("")
+    parts.append("**Data sources:** AirDNA, shared `events` table, Walk Score API, `regulations.json`.")
+    parts.append("")
+    parts.append("**Key assumptions:** 0.35 bedrooms + 0.25 type + 0.20 distance + 0.20 quality similarity, "
+                 "Monte Carlo samples from comp distribution, regulation check runs first.")
+    parts.append("")
+
+    rag = query_methodology("feasibility scoring and comp analysis")
+    if rag.available and rag.citations:
+        parts.append("**Citations:**")
+        for c in rag.citations:
+            snippet = c.chunk_text[:200].strip()
+            parts.append(f"- *{c.source_name}* -- {snippet} (sim {c.similarity:.2f})")
+    else:
+        parts.append(f"_{rag.note or 'RAG citations not yet populated.'}_")
+
+    parts.append("")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"_Generated by feaso-2 at {datetime.now(timezone.utc).isoformat(timespec='minutes')}._")
+
+    return "\n".join(parts)
+
+
+def _build_html(md: str, a: Any) -> str:
+    try:
+        import markdown2
+        body = markdown2.markdown(md, extras=["tables", "fenced-code-blocks", "header-ids"])
+    except Exception:
+        body = f"<pre>{md}</pre>"
+
+    title = f"Feasibility Report -- {getattr(a, 'address', 'Unknown')}"
+    css = (
+        "@page { size: A4; margin: 22mm 18mm; }"
+        "body { font-family: Helvetica, Arial, sans-serif; color: #1f2937; line-height: 1.5; }"
+        "h1 { color: #0F172A; border-bottom: 3px solid #AF7225; padding-bottom: 8px; }"
+        "h2 { color: #0F172A; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; margin-top: 28px; }"
+        "h3 { color: #334155; }"
+        "table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 12px; }"
+        "th, td { padding: 6px 10px; border-bottom: 1px solid #e2e8f0; text-align: left; }"
+        "th { background: #f8fafc; font-weight: 600; color: #475569; }"
+        "em { color: #64748b; }"
+        "code { background: #f1f5f9; padding: 2px 5px; border-radius: 3px; font-size: 11px; }"
+        "strong { color: #0F172A; }"
+        "hr { border: none; border-top: 1px solid #e2e8f0; margin: 24px 0; }"
+    )
+    return (
+        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        f"<title>{title}</title>\n<style>{css}</style>\n</head>\n<body>\n"
+        f"{body}\n</body>\n</html>\n"
+    )
+
+
+def _render_pdf(html: str) -> Optional[bytes]:
+    try:
+        from weasyprint import HTML  # type: ignore
+        return HTML(string=html).write_pdf()  # type: ignore[no-any-return]
+    except Exception as exc:
+        logger.warning("report.pdf_unavailable", error=str(exc)[:200])
+        return None
+
+
+def _base_projection(a: Any) -> Optional[Any]:
+    for p in (getattr(a, "financial_projections", None) or []):
+        if p.projection_type == "base":
+            return p
+    return None
+
+
+def _money(v: Any, *, cents: bool = False) -> str:
+    if v is None:
+        return "-"
+    try:
+        return f"${float(v):,.{2 if cents else 0}f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _pct(v: Any, decimals: int = 1) -> str:
+    if v is None:
+        return "-"
+    try:
+        return f"{float(v) * 100:.{decimals}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _float(v: Any, fallback: str = "-", suffix: str = "") -> str:
+    if v is None:
+        return fallback
+    try:
+        return f"{float(v):.1f}{suffix}"
+    except (TypeError, ValueError):
+        return fallback
