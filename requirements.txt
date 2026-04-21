@@ -25,7 +25,9 @@ tenacity==8.3.0
 mangum==0.17.0
 markdown2==2.4.13
 
-# Install separately when needed (Phase 4-5):
-# chromadb  -- vector DB for RAG
-# weasyprint  -- PDF generation (heavy native deps, skip on Vercel)
-# sentence-transformers  -- embeddings
+# Optional -- install for full feature coverage:
+#   chromadb==0.5.0              # vector store for RAG citations
+#   sentence-transformers==3.0.1 # embeddings for RAG
+#   openai-whisper               # local Whisper (or fall back to openai audio API)
+#   openai==1.30.5               # whisper-1 / future Claude Managed Agents SDK
+#   weasyprint==62.3             # PDF generation (heavy native deps; skipped on Vercel serverless -- HTML fallback served)

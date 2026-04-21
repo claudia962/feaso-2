@@ -59,8 +59,8 @@ export default function AnalysisPage() {
   }
   if (!analysis) return <div className="text-slate-500">Loading analysis {id}…</div>;
 
-  const subjectLat = null as number | null;
-  const subjectLng = null as number | null;
+  const subjectLat = (analysis as unknown as { latitude?: number | null }).latitude ?? null;
+  const subjectLng = (analysis as unknown as { longitude?: number | null }).longitude ?? null;
 
   return (
     <div className="space-y-6">

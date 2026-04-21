@@ -86,6 +86,8 @@ export interface AnalysisResponse {
   status: string;
   address: string;
   created_at: string;
+  latitude?: number | null;
+  longitude?: number | null;
   overall_feasibility_score?: number | null;
   risk_score?: number | null;
   recommendation?: Recommendation | null;
