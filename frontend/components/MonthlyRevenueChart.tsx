@@ -46,7 +46,7 @@ export function MonthlyRevenueChart({
             contentStyle={{ background: "#0f172a", border: "none", borderRadius: 8 }}
             labelStyle={{ color: "#fff", fontWeight: 600 }}
             itemStyle={{ color: "#fff" }}
-            formatter={(value: number) => `$${Number(value).toLocaleString()}`}
+            formatter={(value) => `$${Number(value).toLocaleString()}`}
           />
           <Area
             type="monotone" dataKey="optimistic"
