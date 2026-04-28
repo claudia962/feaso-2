@@ -27,7 +27,7 @@ export function StressPanel({ results }: { results?: StressResult[] }) {
             />
             <Tooltip
               contentStyle={{ background: "#0f172a", border: "none", borderRadius: 8 }}
-              formatter={(value: number) => `${Number(value).toFixed(1)}%`}
+              formatter={(value) => `${Number(value).toFixed(1)}%`}
             />
             <Bar dataKey="impact">
               {data.map((entry, i) => (
