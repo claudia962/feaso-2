@@ -46,7 +46,8 @@ export function MonthlyRevenueChart({
             contentStyle={{ background: "#0f172a", border: "none", borderRadius: 8 }}
             labelStyle={{ color: "#fff", fontWeight: 600 }}
             itemStyle={{ color: "#fff" }}
-            formatter={(value: number) => `$${Number(value).toLocaleString()}`}
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            formatter={(value: any) => `$${Number(value).toLocaleString()}`}
           />
           <Area
             type="monotone" dataKey="optimistic"
