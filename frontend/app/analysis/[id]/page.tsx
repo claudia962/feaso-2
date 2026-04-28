@@ -13,6 +13,7 @@ import { StressPanel } from "@/components/StressPanel";
 import { CompMap } from "@/components/CompMap";
 import { ScenarioBuilder } from "@/components/ScenarioBuilder";
 import { RenovationCalculator } from "@/components/RenovationCalculator";
+import { PMCalculator } from "@/components/PMCalculator";
 import { DownloadButtons } from "@/components/DownloadButtons";
 import { Tabs } from "@/components/Tabs";
 
@@ -244,6 +245,16 @@ export default function AnalysisPage() {
               ) : (
                 <div className="text-slate-500 text-sm">Portfolio fit not yet computed.</div>
               )}
+            </section>
+          ),
+        },
+        {
+          id: "pm-calculator",
+          label: "PM Calculator",
+          content: (
+            <section className="rounded-2xl bg-white shadow p-6 space-y-3">
+              <h3 className="font-semibold text-slate-900">LiveLuxe Hybrid PM Calculator</h3>
+              <PMCalculator grossRevenue={analysis.financials?.year1_gross_revenue} />
             </section>
           ),
         },

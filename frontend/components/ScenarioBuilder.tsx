@@ -27,7 +27,6 @@ export function ScenarioBuilder({ base }: { base?: FinancialResponse | null }) {
     const platformAdjust = revenue * (platform / 100);
     const adjustedExpenses = totalExpenses + mortgageAdjust + platformAdjust;
     const noi = revenue - adjustedExpenses;
-    const capRate = noi / 1; // ratio intentionally left as raw; UI renders %
     return {
       revenue,
       totalExpenses: adjustedExpenses,
